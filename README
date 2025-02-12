@@ -1,12 +1,12 @@
-[要求版本]
-python-telegram-bot>=20.0
-yt-dlp>=2023.3.4
-python-dotenv>=1.0.0
-asyncio>=3.4.3
+## Required Version
+- python-telegram-bot>=20.0
+- yt-dlp>=2023.3.4
+- python-dotenv>=1.0.0
+- asyncio>=3.4.3
 
-[執行步驟]
-1.下載所需套件
-2.[設定.env]
-API_TOKEN=Telegram_Bot_Token
-TEMP_DOWNLOAD_FOLDER=C:/temp/folder
+## Steps
+1.Download the required NodeJS packages
+2.[Setting .env]
+```API_TOKEN=Telegram_Bot_Token
+TEMP_DOWNLOAD_FOLDER=C:/temp/folder```
 3.python bot.py
