@@ -8,6 +8,8 @@ import json
 import subprocess
 import zipfile
 import shutil
+import asyncio.exceptions
+
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext, CallbackQueryHandler
@@ -203,7 +205,7 @@ async def download_video_task(url, destination_folder, message, format_type):
                 message.edit_text("✅ 下載完成，準備發送檔案..."), loop
             )
     def download_video_sync(url, destination_folder, format_type):
-        """同步下載函式：自動選擇最高畫質 + 音訊格式"""
+        """同步下載函式：依照指定格式下載"""
         ydl_extract_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -212,34 +214,34 @@ async def download_video_task(url, destination_folder, message, format_type):
         with yt_dlp.YoutubeDL(ydl_extract_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             formats = info.get("formats", [])
-            # 找最高畫質的 video-only 格式
-            video_candidates = [f for f in formats if f.get("vcodec") not in [None, "none", "images"] and f.get("acodec") in [None, "none"] and f.get("height")]
-            if not video_candidates:
-                raise Exception("找不到可用的影片格式")
-            best_video = max(video_candidates, key=lambda f: f.get("height", 0))
-            video_id = best_video["format_id"]
-            # 找最佳音質的 audio-only 格式
-            audio_candidates = [
-                f for f in formats
-                if f.get("vcodec") in [None, "none"]
-                and f.get("acodec") not in [None, "none"]
-                and f.get("ext") == "mp4" 
-            ]
-            best_audio = max(audio_candidates, key=lambda f: f.get("abr", 0)) if audio_candidates else None
-            audio_id = best_audio["format_id"] if best_audio else None
-        # 組合 format id
-        chosen_format = f"{video_id}+{audio_id}" if audio_id else video_id
+            if format_type == "audio":
+                audio_candidates = [
+                    f for f in formats
+                    if f.get("vcodec") in [None, "none"]
+                    and f.get("acodec") not in [None, "none"]
+                ]
+                if not audio_candidates:
+                    raise Exception("找不到可用的音訊格式")
+                best_audio = max(audio_candidates, key=lambda f: f.get("abr", 0))
+                chosen_format = best_audio["format_id"]
+            else:
+                chosen_format = format_type
         ydl_download_opts = {
             'outtmpl': f'{destination_folder}/%(title)s.%(ext)s',
             'progress_hooks': [progress_hook],
-            'format': format_type,
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4'
-            }]
+            'format': chosen_format,
         }
         if format_type == "audio":
-            ydl_download_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+            ydl_download_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        else:
+            ydl_download_opts['postprocessors'] = [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }]
         with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
             ydl.download([url])
         file_path = max(
@@ -249,15 +251,17 @@ async def download_video_task(url, destination_folder, message, format_type):
         return file_path
     try:
         # 先下載檔案，取得檔案目錄
-        file_path = await loop.run_in_executor(
-            executor,
-            download_video_sync,
-            url,
-            destination_folder,
-            format_type
+        file_path = await asyncio.wait_for(
+            loop.run_in_executor(
+                executor,
+                download_video_sync,
+                url,
+                destination_folder,
+                format_type
+            ),
+            timeout=300
         )
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        # 優先嘗試打包 ZIP
         if file_size_mb > TELEGRAM_MAX_SIZE_MB:
             await message.edit_text("📦 檔案過大，正在打包為 ZIP...")
             zip_path = file_path.replace(".mp4", ".zip")
@@ -278,45 +282,76 @@ async def download_video_task(url, destination_folder, message, format_type):
                     await message.edit_text("❌ 壓縮失敗，請稍後再試。")
                     return
                 file_path = compressed_path
-        # 最終發送檔案
         await message.edit_text("📤 正在發送檔案...")
         await (message.reply_audio if format_type == "audio" else message.reply_video)(open(file_path, 'rb'))
         os.remove(file_path)
         await message.edit_text("✅ 檔案已成功發送！")
+    except asyncio.TimeoutError:
+        try:
+            files = os.listdir(destination_folder)
+            if files:
+                latest_file = max(
+                    [os.path.join(destination_folder, f) for f in files],
+                    key=os.path.getctime
+                )
+                file_size_mb = os.path.getsize(latest_file) / (1024 * 1024)
+                if file_size_mb > TELEGRAM_MAX_SIZE_MB:
+                    await message.edit_text("📦 檔案太大，處理 ZIP 或壓縮中...")
+                else:
+                    await message.edit_text("📤 雖然超時，但檔案已下載完成，正在嘗試發送...")
+                    await (message.reply_audio if format_type == "audio" else message.reply_video)(open(latest_file, 'rb'))
+                    os.remove(latest_file)
+                    await message.edit_text("✅ 檔案已成功發送！")
+            else:
+                await message.edit_text("⚠️ 超時且找不到檔案，請重新下載。")
+        except Exception as e:
+            await message.edit_text(f"❌ 超時後處理失敗：{e}")
     except Exception as e:
         await message.edit_text(f"❌ 下載錯誤： {e}")
 async def button_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
-    url, format_id = query.data.split("|")
-    # 從 yt-dlp 再查一次，取得畫質ID對應的高度
-    try:
-        ydl_opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = info.get("formats", [])
-            matched = next((f for f in formats if f.get("format_id") == format_id), None)
-            resolution = f"{matched.get('height')}p" if matched and matched.get("height") else format_id
-    except Exception as e:
-        print(f"解析畫質失敗：{e}")
-        resolution = format_id  # 如果失敗就退回顯示原本的畫質ID
-    message = await query.message.reply_text(f"🎬 開始下載畫質 {resolution}...")
-    asyncio.create_task(download_video_task(url, TEMP_DOWNLOAD_FOLDER, message, format_id))
+
+    data = query.data.split("|")
+    action = data[0]
+
+    if action == "choose_type":
+        chosen_type = data[1]
+        url = context.user_data.get('download_url')
+        if not url:
+            await query.message.reply_text("❗ 找不到下載連結，請重新使用 /download 指令。")
+            return
+        if chosen_type == "audio":
+            message = await query.message.reply_text("🎵 開始下載最高音質 mp3...")
+            asyncio.create_task(download_video_task(url, TEMP_DOWNLOAD_FOLDER, message, "audio"))
+        else:
+            await query.message.reply_text("📦 正在讀取可用畫質，請稍候...")
+            buttons = get_video_format_buttons(url)
+            if not buttons:
+                await query.message.reply_text("❌ 無法取得影片格式或影片無法下載。")
+                return
+            await query.message.reply_text(
+                "🎬 請選擇要下載的影片畫質（建議下載最高畫質 + 未知大小，避免檔案毀損）",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+    else:
+        url, format_id = data
+        message = await query.message.reply_text("🎬 開始下載選定畫質...")
+        asyncio.create_task(download_video_task(url, TEMP_DOWNLOAD_FOLDER, message, format_id))
 async def download(update: Update, context: CallbackContext):
     params = update.message.text.split(" ")
     if len(params) < 2:
         await update.message.reply_text("❗ 請提供有效的連結！")
         return
     url = params[1]
-    await update.message.reply_text("📦 正在讀取可用畫質，請稍候...")
-
-    buttons = get_video_format_buttons(url)
-
-    if not buttons:
-        await update.message.reply_text("❌ 無法取得影片格式或影片無法下載。")
-        return
-
-    await update.message.reply_text("🔽 請選擇要下載的畫質（建議下載最高畫質 + 未知大小，避免檔案毀損）：", reply_markup=InlineKeyboardMarkup(buttons))
+    context.user_data['download_url'] = url
+    buttons = [
+        [
+            InlineKeyboardButton("🎬 下載影片 (MP4)", callback_data=f"choose_type|video"),
+            InlineKeyboardButton("🎵 下載音樂 (MP3)", callback_data=f"choose_type|audio")
+        ]
+    ]
+    await update.message.reply_text("🔽 請選擇要下載的格式：", reply_markup=InlineKeyboardMarkup(buttons))
 async def help_command(update: Update, context: CallbackContext):
     help_text = ("📌 **可用指令列表**：\n\n"
                  "/download <影片連結> - 下載影片或音軌\n"
